@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 # Home Assistant MQTT discovery. HA creates the entities itself from these, so there is no custom
 # component to write or keep working across HA releases.
 HA_DISCOVERY_PREFIX = "homeassistant"
-STATE_TOPIC = "radwatch/state"
+STATE_TOPIC_FMT = "radwatch/{serial}/state"   # per device: one topic per box, never shared
 SENSORS = [
     # key, name, unit, device_class, state_class, icon
     ("dose_rate", "Dose rate", "\u00b5Sv/h", None, "measurement", "mdi:radioactive"),
@@ -42,21 +42,25 @@ def mqtt_connect(host, port):
     return c
 
 
+def state_topic(serial):
+    return STATE_TOPIC_FMT.format(serial=serial)
+
+
 def mqtt_announce(client, serial):
     """One retained discovery message per sensor. HA picks them up with no configuration."""
     device = {"identifiers": [f"radwatch_{serial}"], "name": f"RadiaCode {serial}",
               "manufacturer": "RadiaCode", "model": "10x", "via_device": "radwatch"}
     for key, name, unit, dev_class, state_class, icon in SENSORS:
         uid = f"radwatch_{serial}_{key}"
-        cfg = {"name": name, "unique_id": uid, "state_topic": STATE_TOPIC,
+        cfg = {"name": name, "unique_id": uid, "state_topic": state_topic(serial),
                "value_template": "{{ value_json." + key + " }}",
                "unit_of_measurement": unit, "state_class": state_class,
                "icon": icon, "device": device,
-               "availability_topic": "radwatch/status"}
+               "availability_topic": f"radwatch/{serial}/status"}
         if dev_class:
             cfg["device_class"] = dev_class
         client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{uid}/config", json.dumps(cfg), retain=True)
-    client.publish("radwatch/status", "online", retain=True)
+    client.publish(f"radwatch/{serial}/status", "online", retain=True)
 
 # Gamma lines, keV. PROVENANCE: these are the standard natural-background and common-source lines.
 # Check each against a published table (IAEA / LNHB) before any number from here goes in public.
@@ -143,7 +147,7 @@ def cmd_log(a):
                          (rec.dt.isoformat(), rec.count_rate, rec.count_rate_err,
                           rec.dose_rate, rec.dose_rate_err, rec.flags))
             if client:
-                client.publish(STATE_TOPIC, json.dumps({
+                client.publish(state_topic(serial), json.dumps({
                     "dose_rate": round(rec.dose_rate * 1e6, 4),      # Sv/h from the device -> uSv/h
                     "count_rate": round(rec.count_rate, 3),
                     "dose_rate_err": round(rec.dose_rate_err, 1),
@@ -349,9 +353,14 @@ def cmd_selftest(a):
         def publish(self, topic, payload, retain=False): self.msgs.append((topic, payload))
     f = _Fake(); mqtt_announce(f, "TEST123")
     cfgs = [json.loads(p) for t, p in f.msgs if t.endswith("/config")]
+    g = _Fake(); mqtt_announce(g, "OTHER456")
+    cfgs2 = [json.loads(p) for t, p in g.msgs if t.endswith("/config")]
     disc_ok = (len(cfgs) == len(SENSORS)
-               and all(c["state_topic"] == STATE_TOPIC and c["unique_id"] and c["device"] for c in cfgs))
-    print(f"ha discovery  : {len(cfgs)} sensor configs, well formed: {disc_ok}")
+               and all(c["state_topic"] == state_topic("TEST123") and c["unique_id"] and c["device"] for c in cfgs)
+               # two devices must never share a state topic: three boxes publishing to one topic
+               # would silently overwrite each other
+               and cfgs[0]["state_topic"] != cfgs2[0]["state_topic"])
+    print(f"ha discovery  : {len(cfgs)} sensor configs, well formed and per-device topics: {disc_ok}")
     ok = ok and disc_ok
 
     # The alerting maths, with a negative control: steady Poisson counts must NOT alert.

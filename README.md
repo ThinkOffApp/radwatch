@@ -16,8 +16,10 @@ The RadiaCode ecosystem already has good software. Before writing anything we su
 [darkmatter2222/Open-RadiaCode-Android](https://github.com/darkmatter2222/Open-RadiaCode-Android)
 for a phone app, and two projects that plot tracks on maps. We use those rather than reimplement them.
 
-What was missing, across 25 public repositories, was anything that keeps a defensible statistical
-history, and anything that puts a local language model next to the detector. That is what this is.
+Across the 25 repositories that search returned, **this survey found** nothing that keeps a
+defensible statistical history, and nothing that puts a local language model next to the detector.
+That is a statement about what we reviewed on 4 Oct 2026, not a claim about the whole ecosystem.
+If one of these exists and we missed it, please open an issue and we will use yours instead.
 
 ## Commands
 
@@ -54,3 +56,26 @@ and exits non-zero. The numbers are the product; the sentence is the convenience
 - **Calibration.** See above. Needs the device.
 - Gamma line energies in `LINES` are the standard ones but have not each been checked against a
   published table. Verify against IAEA or LNHB before publishing any number from them.
+
+## Credits
+
+This stands on other people's work, and uses it rather than reimplementing it:
+
+- **[cdump/radiacode](https://github.com/cdump/radiacode)** — the Python library that talks to the
+  device over USB and Bluetooth. Everything here depends on it.
+- **[303Bryan/ha-radiacode](https://github.com/303Bryan/ha-radiacode)** — Home Assistant integration
+  with live entities, device controls and alarm thresholds. Use this for the dashboard.
+- **[darkmatter2222/Open-RadiaCode-Android](https://github.com/darkmatter2222/Open-RadiaCode-Android)**
+  — Android app with BLE monitoring, widgets and isotope identification.
+- **[matveynator/chicha-isotope-map](https://github.com/matveynator/chicha-isotope-map)** and
+  **[igmrlm/RadiacodeMapGenerator](https://github.com/igmrlm/RadiacodeMapGenerator)** — plotting
+  tracks and heatmaps on maps.
+- **[ckuethe/radiacode-tools](https://github.com/ckuethe/radiacode-tools)** — auxiliary tooling.
+
+The RadiaCode devices are made by Scan-Electronics. This project is not affiliated with them.
+
+## Status
+
+Early. The device has not arrived yet, so nothing here has been exercised against real hardware:
+`selftest` passes and the empty-database paths work, which is not the same thing. Treat every
+number it produces as unverified until that changes.
