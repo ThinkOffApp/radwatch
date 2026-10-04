@@ -34,9 +34,21 @@ SENSORS = [
 ]
 
 
-def mqtt_connect(host, port):
+def mqtt_connect(host, port, serial):
+    """One client per device.
+
+    The client id MUST be per-device. MQTT brokers enforce unique client ids and disconnect the
+    existing session when a second client claims the same one, so a hardcoded "radwatch" would
+    have had the Pi, the Ventuno and the VTA kicking each other off the broker in a loop, whatever
+    their topics were (codexmb, 4 Oct).
+
+    The last will is what actually makes the entities go unavailable if this process dies. Without
+    it the broker never publishes "offline" and Home Assistant shows a stale reading as live
+    forever, which is worse than showing nothing.
+    """
     import paho.mqtt.client as mqtt
-    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="radwatch")
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"radwatch-{serial}")
+    c.will_set(f"radwatch/{serial}/status", "offline", retain=True)
     c.connect(host, port, keepalive=60)
     c.loop_start()
     return c
@@ -135,7 +147,7 @@ def cmd_log(a):
     print(f"connected: {serial} fw {rc.fw_version()}", file=sys.stderr)
     client = None
     if a.mqtt:
-        client = mqtt_connect(a.mqtt_host, a.mqtt_port)
+        client = mqtt_connect(a.mqtt_host, a.mqtt_port, serial)
         mqtt_announce(client, serial)
         print(f"mqtt: announced {len(SENSORS)} sensors to {a.mqtt_host}:{a.mqtt_port}", file=sys.stderr)
     last_spec = 0.0
