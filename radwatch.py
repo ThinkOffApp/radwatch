@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""radwatch - continuous logging and spectrum analysis for a RadiaCode 10x.
+
+Three separable pieces, deliberately:
+
+  log      poll the device, append dose rate and count rate to SQLite, store a spectrum every N minutes
+  analyse  peak-find a stored spectrum, convert channels to keV with the device's own calibration,
+           and match peaks against a gamma line table
+  watch    Poisson alerting on count rate against a rolling baseline
+  explain  the local model turns what watch and analyse computed into one paragraph
+
+Nothing here asks a language model. Counting statistics are Poisson and the right test is arithmetic;
+an LLM would be slower and worse at it. The model's job is the language layer on top: explaining a
+spectrum, writing the daily summary, answering "was anything odd last week". That lives elsewhere and
+reads this database.
+
+Usage:
+  radwatch.py log    [--serial SN | --bt MAC] [--db PATH] [--spectrum-every SEC]
+  radwatch.py analyse [--db PATH] [--at ISO8601]
+  radwatch.py selftest
+"""
+import argparse, json, math, sqlite3, sys, time, urllib.request
+from datetime import datetime, timezone
+
+# Home Assistant MQTT discovery. HA creates the entities itself from these, so there is no custom
+# component to write or keep working across HA releases.
+HA_DISCOVERY_PREFIX = "homeassistant"
+STATE_TOPIC = "radwatch/state"
+SENSORS = [
+    # key, name, unit, device_class, state_class, icon
+    ("dose_rate", "Dose rate", "\u00b5Sv/h", None, "measurement", "mdi:radioactive"),
+    ("count_rate", "Count rate", "cps", None, "measurement", "mdi:counter"),
+    ("dose_rate_err", "Dose rate error", "%", None, "measurement", "mdi:plus-minus-variant"),
+]
+
+
+def mqtt_connect(host, port):
+    import paho.mqtt.client as mqtt
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="radwatch")
+    c.connect(host, port, keepalive=60)
+    c.loop_start()
+    return c
+
+
+def mqtt_announce(client, serial):
+    """One retained discovery message per sensor. HA picks them up with no configuration."""
+    device = {"identifiers": [f"radwatch_{serial}"], "name": f"RadiaCode {serial}",
+              "manufacturer": "RadiaCode", "model": "10x", "via_device": "radwatch"}
+    for key, name, unit, dev_class, state_class, icon in SENSORS:
+        uid = f"radwatch_{serial}_{key}"
+        cfg = {"name": name, "unique_id": uid, "state_topic": STATE_TOPIC,
+               "value_template": "{{ value_json." + key + " }}",
+               "unit_of_measurement": unit, "state_class": state_class,
+               "icon": icon, "device": device,
+               "availability_topic": "radwatch/status"}
+        if dev_class:
+            cfg["device_class"] = dev_class
+        client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{uid}/config", json.dumps(cfg), retain=True)
+    client.publish("radwatch/status", "online", retain=True)
+
+# Gamma lines, keV. PROVENANCE: these are the standard natural-background and common-source lines.
+# Check each against a published table (IAEA / LNHB) before any number from here goes in public.
+LINES = [
+    (59.54, "Am-241", "smoke detector source"),
+    (238.6, "Pb-212", "Th-232 chain"),
+    (295.2, "Pb-214", "Ra-226 chain"),
+    (351.9, "Pb-214", "Ra-226 chain"),
+    (511.0, "annihilation", "positron, or cosmic"),
+    (583.2, "Tl-208", "Th-232 chain"),
+    (609.3, "Bi-214", "Ra-226 chain"),
+    (661.657, "Cs-137", "fallout or a check source"),
+    (911.2, "Ac-228", "Th-232 chain"),
+    (1173.2, "Co-60", "industrial source"),
+    (1332.5, "Co-60", "industrial source"),
+    (1460.8, "K-40", "natural, in soil, bananas, salt substitute"),
+    (1764.5, "Bi-214", "Ra-226 chain"),
+    (2614.5, "Tl-208", "Th-232 chain, the highest common natural line"),
+]
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS reading(
+  ts TEXT PRIMARY KEY, count_rate REAL, count_rate_err REAL, dose_rate REAL, dose_rate_err REAL, flags INT);
+CREATE TABLE IF NOT EXISTS spectrum(
+  ts TEXT PRIMARY KEY, duration_s REAL, a0 REAL, a1 REAL, a2 REAL, counts TEXT);
+"""
+
+def db(path):
+    c = sqlite3.connect(path); c.executescript(SCHEMA); return c
+
+def ch_to_kev(ch, a0, a1, a2):
+    return a0 + a1 * ch + a2 * ch * ch
+
+def find_peaks(counts, a0, a1, a2, min_sigma=4.0, window=12):
+    """Peaks that stand above the local continuum by min_sigma, with Poisson sigma = sqrt(background).
+
+    Deliberately crude and deliberately explicit: a real analysis fits the peak shape. This is here to
+    say 'something is at about 662 keV', not to quantify activity.
+    """
+    out = []
+    n = len(counts)
+    for i in range(window, n - window):
+        left = counts[i - window:i - window // 2]
+        right = counts[i + window // 2:i + window]
+        bg = (sum(left) + sum(right)) / max(1, len(left) + len(right))
+        if bg <= 0:
+            continue
+        excess = counts[i] - bg
+        sigma = math.sqrt(bg)
+        if excess < min_sigma * sigma:
+            continue
+        if counts[i] < max(counts[i - 3:i + 4]):       # local maximum only
+            continue
+        out.append({"channel": i, "kev": round(ch_to_kev(i, a0, a1, a2), 1),
+                    "counts": counts[i], "background": round(bg, 1),
+                    "sigma": round(excess / sigma, 1)})
+    return out
+
+def identify(peaks, tol_kev=12.0):
+    for p in peaks:
+        hits = [(abs(p["kev"] - e), nuc, note, e) for e, nuc, note in LINES if abs(p["kev"] - e) <= tol_kev]
+        hits.sort()
+        p["candidates"] = [{"nuclide": n, "line_kev": e, "note": note, "off_by_kev": round(d, 1)}
+                           for d, n, note, e in hits]
+    return peaks
+
+def cmd_log(a):
+    from radiacode import RadiaCode
+    conn = db(a.db)
+    rc = RadiaCode(bluetooth_mac=a.bt, serial_number=a.serial)
+    serial = rc.serial_number()
+    print(f"connected: {serial} fw {rc.fw_version()}", file=sys.stderr)
+    client = None
+    if a.mqtt:
+        client = mqtt_connect(a.mqtt_host, a.mqtt_port)
+        mqtt_announce(client, serial)
+        print(f"mqtt: announced {len(SENSORS)} sensors to {a.mqtt_host}:{a.mqtt_port}", file=sys.stderr)
+    last_spec = 0.0
+    while True:
+        for rec in rc.data_buf():
+            if type(rec).__name__ != "RealTimeData":
+                continue
+            conn.execute("INSERT OR REPLACE INTO reading VALUES(?,?,?,?,?,?)",
+                         (rec.dt.isoformat(), rec.count_rate, rec.count_rate_err,
+                          rec.dose_rate, rec.dose_rate_err, rec.flags))
+            if client:
+                client.publish(STATE_TOPIC, json.dumps({
+                    "dose_rate": round(rec.dose_rate * 1e6, 4),      # Sv/h from the device -> uSv/h
+                    "count_rate": round(rec.count_rate, 3),
+                    "dose_rate_err": round(rec.dose_rate_err, 1),
+                    "ts": rec.dt.isoformat()}))
+        if time.time() - last_spec >= a.spectrum_every:
+            s = rc.spectrum_accum()
+            conn.execute("INSERT OR REPLACE INTO spectrum VALUES(?,?,?,?,?,?)",
+                         (datetime.now(timezone.utc).isoformat(), s.duration.total_seconds(),
+                          s.a0, s.a1, s.a2, json.dumps(s.counts)))
+            last_spec = time.time()
+        conn.commit()
+        time.sleep(a.interval)
+
+def cmd_analyse(a):
+    conn = db(a.db)
+    q = "SELECT ts,duration_s,a0,a1,a2,counts FROM spectrum"
+    row = conn.execute(q + (" WHERE ts<=? ORDER BY ts DESC LIMIT 1" if a.at else " ORDER BY ts DESC LIMIT 1"),
+                       (a.at,) if a.at else ()).fetchone()
+    if not row:
+        print("no spectrum stored yet", file=sys.stderr); return 2
+    ts, dur, a0, a1, a2, counts = row
+    counts = json.loads(counts)
+    peaks = identify(find_peaks(counts, a0, a1, a2))
+    print(json.dumps({"ts": ts, "duration_s": dur, "channels": len(counts),
+                      "total_counts": sum(counts), "peaks": peaks}, indent=1))
+    return 0
+
+def rate_sigma(readings):
+    """Standard error of the MEAN rate over `readings`, each (rate_cps, err_percent, seconds).
+
+    The device reports its own relative uncertainty: radiacode decodes count_rate_err as an
+    unsigned short divided by 10, i.e. a PERCENTAGE to one decimal. Verified in the decoder,
+    not assumed. So sigma_i = rate_i * err_i / 100 and the mean of n independent readings has
+    variance (1/n^2) * sum(sigma_i^2).
+
+    When the device reports no error (zero or missing), fall back to counting statistics proper:
+    Var(rate) = lambda / T where T is the EXPOSURE in seconds, not the number of samples. An
+    earlier version of this used sqrt(mean/n), which silently assumed every reading was exactly
+    one second of independent counting (codexmb, 4 Oct).
+    """
+    n = len(readings)
+    if n == 0:
+        return 0.0, 0.0
+    mean = sum(r for r, _, _ in readings) / n
+    var = 0.0
+    for rate, err_pct, secs in readings:
+        if err_pct and err_pct > 0:
+            s_i = rate * err_pct / 100.0
+        elif secs and secs > 0:
+            s_i = math.sqrt(max(rate, 0.0) / secs)      # Var(rate) = lambda / T
+        else:
+            return mean, float('nan')                    # cannot state an uncertainty: say so
+        var += s_i * s_i
+    return mean, math.sqrt(var) / n
+
+
+def difference_z(window, baseline):
+    """Sigma of (window mean - baseline mean), carrying BOTH uncertainties.
+
+    The baseline is estimated, not known, so its own error belongs in the denominator. Treating
+    it as exact overstates the significance of every alert.
+    """
+    w_mean, w_sig = rate_sigma(window)
+    b_mean, b_sig = rate_sigma(baseline)
+    if math.isnan(w_sig) or math.isnan(b_sig):
+        return float('nan'), w_mean, b_mean
+    denom = math.sqrt(w_sig * w_sig + b_sig * b_sig)
+    if denom <= 0:
+        return 0.0, w_mean, b_mean
+    return (w_mean - b_mean) / denom, w_mean, b_mean
+
+
+def cmd_watch(a):
+    """Rolling-baseline alerting on count rate. Prints one JSON line.
+
+    THE THRESHOLD IS NOT CALIBRATED. 5 sigma is a placeholder until it has been checked against
+    this device's real quiet-background behaviour over hours. The arithmetic below is right; what
+    a real alarm should be set to is an empirical question about one detector in one place, and
+    synthetic data cannot answer it.
+    """
+    conn = db(a.db)
+    rows = conn.execute(
+        "SELECT ts,count_rate,count_rate_err FROM reading ORDER BY ts DESC LIMIT ?",
+        (a.baseline + a.window,)
+    ).fetchall()
+    need = a.baseline + a.window
+    if len(rows) < need:
+        print(f"not enough readings yet: {len(rows)} of {need}", file=sys.stderr)
+        return 2
+    rows.reverse()
+
+    # exposure per reading, from the timestamps rather than assumed
+    def secs(i):
+        if i == 0:
+            return None
+        try:
+            a_ = datetime.fromisoformat(rows[i - 1][0]); b_ = datetime.fromisoformat(rows[i][0])
+            d = (b_ - a_).total_seconds()
+            return d if d > 0 else None
+        except Exception:
+            return None
+
+    series = [(rows[i][1], rows[i][2], secs(i)) for i in range(len(rows))]
+    base, win = series[:a.baseline], series[a.baseline:]
+    z, w_mean, b_mean = difference_z(win, base)
+    out = {"ts": rows[-1][0], "baseline_cps": round(b_mean, 3), "window_cps": round(w_mean, 3),
+           "sigma": None if math.isnan(z) else round(z, 2),
+           "alert": (not math.isnan(z)) and z >= a.sigma,
+           "threshold_calibrated": False}
+    if math.isnan(z):
+        out["note"] = "no device error and no usable timestamps: uncertainty unknown, no alert claimed"
+    print(json.dumps(out))
+    return 0
+
+
+EXPLAIN_SYSTEM = (
+    "You are writing one short paragraph for a radiation monitoring log, for a non-specialist who "
+    "will read it on a phone. You are given numbers that have already been computed. Do NOT decide "
+    "whether anything is anomalous: the sigma value given to you is the decision and it was made by "
+    "counting statistics, not by you. Explain what the numbers mean in plain language, name the "
+    "likely isotopes if peaks are listed, and say plainly if nothing of note happened. Never invent a "
+    "number that is not given to you. No more than four sentences."
+)
+
+
+def cmd_explain(a):
+    """The local model reads what the arithmetic produced and writes the sentence.
+
+    This is the only place a model appears in radwatch, and it is downstream of every decision.
+    It is handed the computed statistics and the identified peaks; it is not handed raw readings
+    to judge, and it cannot raise or clear an alert.
+    """
+    conn = db(a.db)
+    rows = conn.execute("SELECT ts,count_rate,count_rate_err FROM reading ORDER BY ts DESC LIMIT ?",
+                        (a.baseline + a.window,)).fetchall()
+    facts = {"readings_available": len(rows)}
+    if len(rows) >= a.baseline + a.window:
+        rows.reverse()
+        series = [(r[1], r[2], None) for r in rows]
+        z, w_mean, b_mean = difference_z(series[a.baseline:], series[:a.baseline])
+        facts.update({"baseline_cps": round(b_mean, 3), "recent_cps": round(w_mean, 3),
+                      "sigma_above_baseline": None if math.isnan(z) else round(z, 2),
+                      "alert_threshold_sigma": a.sigma,
+                      "alert_raised": (not math.isnan(z)) and z >= a.sigma,
+                      "threshold_calibrated": False})
+    sp = conn.execute("SELECT ts,a0,a1,a2,counts FROM spectrum ORDER BY ts DESC LIMIT 1").fetchone()
+    if sp:
+        peaks = identify(find_peaks(json.loads(sp[4]), sp[1], sp[2], sp[3]))
+        facts["spectrum_ts"] = sp[0]
+        facts["peaks"] = [{"kev": p["kev"], "sigma": p["sigma"],
+                           "candidates": [c["nuclide"] for c in p["candidates"]]} for p in peaks[:8]]
+    if a.facts_only:
+        print(json.dumps(facts, indent=1)); return 0
+
+    body = {"model": a.model, "temperature": 0.2, "max_tokens": 220,
+            "messages": [{"role": "system", "content": EXPLAIN_SYSTEM},
+                         {"role": "user", "content": json.dumps(facts, indent=1)}]}
+    req = urllib.request.Request(a.endpoint.rstrip("/") + "/v1/chat/completions",
+                                 json.dumps(body).encode(), {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=a.timeout) as r:
+            d = json.load(r)
+        print(d["choices"][0]["message"]["content"].strip())
+    except Exception as e:
+        # Say the model was unreachable AND print the facts, so a dead endpoint never costs you
+        # the measurement. The numbers are the product; the sentence is the convenience.
+        print(f"local model unreachable ({type(e).__name__}): {e}", file=sys.stderr)
+        print(json.dumps(facts, indent=1))
+        return 1
+    return 0
+
+
+def cmd_selftest(a):
+    """A synthetic spectrum with two known lines, and a flat one that must yield nothing."""
+    import random
+    random.seed(7)
+    a0, a1, a2 = 0.0, 2.4, 0.0           # 2.4 keV per channel, 1024 channels -> ~2.5 MeV
+    n = 1024
+    def peak_at(counts, kev, area, width_ch=4):
+        c = int((kev - a0) / a1)
+        for d in range(-3 * width_ch, 3 * width_ch + 1):
+            if 0 <= c + d < n:
+                counts[c + d] += int(area * math.exp(-0.5 * (d / width_ch) ** 2))
+    flat = [max(0, int(random.gauss(300, 17))) for _ in range(n)]
+    spiked = list(flat)
+    peak_at(spiked, 661.657, 2600)       # Cs-137
+    peak_at(spiked, 1460.8, 1800)        # K-40
+
+    found = identify(find_peaks(spiked, a0, a1, a2))
+    names = {c["nuclide"] for p in found for c in p["candidates"]}
+    print(f"spiked spectrum: {len(found)} peaks, candidates {sorted(names)}")
+    ok = "Cs-137" in names and "K-40" in names
+
+    # NEGATIVE CONTROL: the same statistics with no peaks must find nothing. A finder that cannot
+    # fail is not a finder.
+    noise = identify(find_peaks(flat, a0, a1, a2))
+    print(f"flat spectrum  : {len(noise)} peaks (must be 0)")
+    ok = ok and len(noise) == 0
+
+    # the discovery payloads must be valid JSON and name a state topic HA can read
+    class _Fake:
+        def __init__(self): self.msgs = []
+        def publish(self, topic, payload, retain=False): self.msgs.append((topic, payload))
+    f = _Fake(); mqtt_announce(f, "TEST123")
+    cfgs = [json.loads(p) for t, p in f.msgs if t.endswith("/config")]
+    disc_ok = (len(cfgs) == len(SENSORS)
+               and all(c["state_topic"] == STATE_TOPIC and c["unique_id"] and c["device"] for c in cfgs))
+    print(f"ha discovery  : {len(cfgs)} sensor configs, well formed: {disc_ok}")
+    ok = ok and disc_ok
+
+    # The alerting maths, with a negative control: steady Poisson counts must NOT alert.
+    # Exercises the ARITHMETIC only. It cannot calibrate a device threshold: these are synthetic
+    # one-second exposures with no detector behind them, which is why `watch` reports
+    # threshold_calibrated: false until the real thing has run quiet for hours.
+    quiet = [(random.gauss(10, math.sqrt(10)), 0.0, 1.0) for _ in range(630)]
+    z_quiet, _, _ = difference_z(quiet[600:], quiet[:600])
+    rise = [(random.gauss(10, math.sqrt(10)), 0.0, 1.0) for _ in range(600)] \
+         + [(random.gauss(14, math.sqrt(14)), 0.0, 1.0) for _ in range(30)]
+    z_loud, _, _ = difference_z(rise[600:], rise[:600])
+    # and the device-reported-error path, which is what will actually run
+    dev = [(10.0, 3.0, 1.0) for _ in range(600)] + [(14.0, 3.0, 1.0) for _ in range(30)]
+    z_dev, _, _ = difference_z(dev[600:], dev[:600])
+    print(f"stats (synthetic, NOT a calibration): quiet {z_quiet:+.1f} (<5), 40% rise {z_loud:+.1f} (>=5), "
+          f"device-err path {z_dev:+.1f} (>=5)")
+    alert_ok = z_quiet < 5.0 and z_loud >= 5.0 and z_dev >= 5.0
+    ok = ok and alert_ok
+
+    print("SELFTEST", "PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    lg = sub.add_parser("log"); lg.set_defaults(fn=cmd_log)
+    lg.add_argument("--serial"); lg.add_argument("--bt")
+    lg.add_argument("--db", default="radwatch.sqlite")
+    lg.add_argument("--interval", type=float, default=2.0)
+    lg.add_argument("--spectrum-every", dest="spectrum_every", type=float, default=600.0)
+    lg.add_argument("--mqtt", action="store_true", help="publish to MQTT with Home Assistant discovery")
+    lg.add_argument("--mqtt-host", dest="mqtt_host", default="127.0.0.1")
+    lg.add_argument("--mqtt-port", dest="mqtt_port", type=int, default=1883)
+    an = sub.add_parser("analyse"); an.set_defaults(fn=cmd_analyse)
+    an.add_argument("--db", default="radwatch.sqlite"); an.add_argument("--at")
+    w = sub.add_parser("watch"); w.set_defaults(fn=cmd_watch)
+    w.add_argument("--db", default="radwatch.sqlite")
+    w.add_argument("--baseline", type=int, default=600, help="readings forming the baseline")
+    w.add_argument("--window", type=int, default=30, help="recent readings tested against it")
+    w.add_argument("--sigma", type=float, default=5.0, help="alert threshold in sigma")
+    ex = sub.add_parser("explain"); ex.set_defaults(fn=cmd_explain)
+    ex.add_argument("--db", default="radwatch.sqlite")
+    ex.add_argument("--endpoint", default="http://127.0.0.1:8081", help="OpenAI-compatible local model")
+    ex.add_argument("--model", default="local")
+    ex.add_argument("--baseline", type=int, default=600)
+    ex.add_argument("--window", type=int, default=30)
+    ex.add_argument("--sigma", type=float, default=5.0)
+    ex.add_argument("--timeout", type=float, default=120)
+    ex.add_argument("--facts-only", dest="facts_only", action="store_true",
+                    help="print the facts that would be sent, and send nothing")
+    st = sub.add_parser("selftest"); st.set_defaults(fn=cmd_selftest)
+    a = p.parse_args()
+    return a.fn(a)
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
