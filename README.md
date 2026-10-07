@@ -26,8 +26,18 @@ If one of these exists and we missed it, please open an issue and we will use yo
     radwatch.py log      poll the device into SQLite, store a spectrum periodically
     radwatch.py analyse  peak-find a stored spectrum, match gamma lines, name candidate isotopes
     radwatch.py watch    rolling-baseline significance on count rate
+    radwatch.py status   one JSON object for dashboards: latest reading, battery, temperature,
+                         accumulated dose and the watch verdict, read from the database read-only
     radwatch.py explain  the local model reads what watch and analyse computed and writes a paragraph
     radwatch.py selftest runs with no hardware attached
+
+`status` is for other programs (CarWatch's Radiation page reads it). It never computes anything
+`watch` does not: the verdict comes from the same function. Exit 0 means the database was read,
+even when it holds no readings yet (`"reading": null`). Exit 2 means it could not be read, with the
+reason in `"error"`, and a mistyped `--db` is reported rather than silently created as an empty file.
+Battery, temperature and accumulated dose come from the device's periodic RareData records, which
+`log` now stores in a `rare` table; a database written by an older `log` reports `"device": null`.
+Dose values use one `TO_MICRO` factor shared with the MQTT path, unverified against the device.
 
 ## The statistics, stated honestly
 
