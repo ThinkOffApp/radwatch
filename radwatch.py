@@ -7,6 +7,7 @@ Three separable pieces, deliberately:
   analyse  peak-find a stored spectrum, convert channels to keV with the device's own calibration,
            and match peaks against a gamma line table
   watch    Poisson alerting on count rate against a rolling baseline
+  status   one JSON object for dashboards: latest reading, device battery/temperature/dose, watch verdict
   explain  the local model turns what watch and analyse computed into one paragraph
 
 Nothing here asks a language model. Counting statistics are Poisson and the right test is arithmetic;
@@ -17,9 +18,10 @@ reads this database.
 Usage:
   radwatch.py log    [--serial SN | --bt MAC] [--db PATH] [--spectrum-every SEC]
   radwatch.py analyse [--db PATH] [--at ISO8601]
+  radwatch.py status [--db PATH]
   radwatch.py selftest
 """
-import argparse, json, math, sqlite3, sys, time, urllib.request
+import argparse, json, math, os, sqlite3, sys, time, urllib.request
 from datetime import datetime, timezone
 
 # Home Assistant MQTT discovery. HA creates the entities itself from these, so there is no custom
@@ -32,6 +34,13 @@ SENSORS = [
     ("count_rate", "Count rate", "cps", None, "measurement", "mdi:counter"),
     ("dose_rate_err", "Dose rate error", "%", None, "measurement", "mdi:plus-minus-variant"),
 ]
+
+
+# Device protocol units -> micro-units. radiacode documents dose_rate and the accumulated dose only as
+# "device protocol units"; the MQTT path has always multiplied by 1e6 to get uSv/h. ONE constant so
+# the dashboard and Home Assistant can never disagree. Unverified until the device has arrived and
+# been read side by side with its own display.
+TO_MICRO = 1e6
 
 
 def mqtt_connect(host, port, serial):
@@ -98,6 +107,8 @@ CREATE TABLE IF NOT EXISTS reading(
   ts TEXT PRIMARY KEY, count_rate REAL, count_rate_err REAL, dose_rate REAL, dose_rate_err REAL, flags INT);
 CREATE TABLE IF NOT EXISTS spectrum(
   ts TEXT PRIMARY KEY, duration_s REAL, a0 REAL, a1 REAL, a2 REAL, counts TEXT);
+CREATE TABLE IF NOT EXISTS rare(
+  ts TEXT PRIMARY KEY, duration_s REAL, dose REAL, temperature_c REAL, charge_pct REAL);
 """
 
 def db(path):
@@ -153,14 +164,22 @@ def cmd_log(a):
     last_spec = 0.0
     while True:
         for rec in rc.data_buf():
-            if type(rec).__name__ != "RealTimeData":
+            kind = type(rec).__name__
+            if kind == "RareData":
+                # Battery, temperature and the accumulated dose arrive here, every minute or so.
+                # Stored raw; `status` converts the dose with TO_MICRO.
+                conn.execute("INSERT OR REPLACE INTO rare VALUES(?,?,?,?,?)",
+                             (rec.dt.isoformat(), rec.duration, rec.dose,
+                              rec.temperature, rec.charge_level))
+                continue
+            if kind != "RealTimeData":
                 continue
             conn.execute("INSERT OR REPLACE INTO reading VALUES(?,?,?,?,?,?)",
                          (rec.dt.isoformat(), rec.count_rate, rec.count_rate_err,
                           rec.dose_rate, rec.dose_rate_err, rec.flags))
             if client:
                 client.publish(state_topic(serial), json.dumps({
-                    "dose_rate": round(rec.dose_rate * 1e6, 4),      # Sv/h from the device -> uSv/h
+                    "dose_rate": round(rec.dose_rate * TO_MICRO, 4),  # device units -> uSv/h, see TO_MICRO
                     "count_rate": round(rec.count_rate, 3),
                     "dose_rate_err": round(rec.dose_rate_err, 1),
                     "ts": rec.dt.isoformat()}))
@@ -240,15 +259,24 @@ def cmd_watch(a):
     a real alarm should be set to is an empirical question about one detector in one place, and
     synthetic data cannot answer it.
     """
-    conn = db(a.db)
+    out, why = watch_state(db(a.db), a.baseline, a.window, a.sigma)
+    if out is None:
+        print(why, file=sys.stderr)
+        return 2
+    print(json.dumps(out))
+    return 0
+
+
+def watch_state(conn, baseline, window, sigma):
+    """The watch verdict as (dict, None), or (None, reason) when there are too few readings.
+    Shared by `watch` and `status` so a dashboard shows exactly the number `watch` would print."""
     rows = conn.execute(
         "SELECT ts,count_rate,count_rate_err FROM reading ORDER BY ts DESC LIMIT ?",
-        (a.baseline + a.window,)
+        (baseline + window,)
     ).fetchall()
-    need = a.baseline + a.window
+    need = baseline + window
     if len(rows) < need:
-        print(f"not enough readings yet: {len(rows)} of {need}", file=sys.stderr)
-        return 2
+        return None, f"not enough readings yet: {len(rows)} of {need}"
     rows.reverse()
 
     # exposure per reading, from the timestamps rather than assumed
@@ -263,16 +291,78 @@ def cmd_watch(a):
             return None
 
     series = [(rows[i][1], rows[i][2], secs(i)) for i in range(len(rows))]
-    base, win = series[:a.baseline], series[a.baseline:]
+    base, win = series[:baseline], series[baseline:]
     z, w_mean, b_mean = difference_z(win, base)
     out = {"ts": rows[-1][0], "baseline_cps": round(b_mean, 3), "window_cps": round(w_mean, 3),
            "sigma": None if math.isnan(z) else round(z, 2),
-           "alert": (not math.isnan(z)) and z >= a.sigma,
+           "alert": (not math.isnan(z)) and z >= sigma,
            "threshold_calibrated": False}
     if math.isnan(z):
         out["note"] = "no device error and no usable timestamps: uncertainty unknown, no alert claimed"
+    return out, None
+
+
+def age_s(ts, now=None):
+    """Seconds since an ISO timestamp from this database, or None if it does not parse.
+
+    radiacode stamps readings with NAIVE local time (base_time = datetime.now() at connect), so a
+    naive stamp is compared with naive local now. An aware stamp is compared with aware now."""
+    try:
+        t = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+    if now is None:
+        now = datetime.now(timezone.utc) if t.tzinfo else datetime.now()
+    elif t.tzinfo is None and now.tzinfo is not None:
+        now = now.astimezone().replace(tzinfo=None)
+    return round((now - t).total_seconds(), 1)
+
+
+def status(path, baseline=600, window=30, sigma=5.0, now=None):
+    """Everything a dashboard needs, as one dict, read from the database WITHOUT writing to it.
+
+    The database is opened read-only: `db()` would create an empty file at a mistyped path and the
+    dashboard would then report "no readings yet" forever instead of "wrong path". A missing file is
+    an error with the path in it, an empty database is ok with reading None. Those two must never
+    look alike to whoever reads this."""
+    if not os.path.isfile(path):
+        return {"ok": False, "error": f"no radwatch database at {path}"}
+    try:
+        conn = sqlite3.connect("file:" + urllib.request.pathname2url(os.path.abspath(path)) + "?mode=ro",
+                               uri=True)
+        n = conn.execute("SELECT COUNT(*) FROM reading").fetchone()[0]
+        row = conn.execute("SELECT ts,count_rate,count_rate_err,dose_rate,dose_rate_err "
+                           "FROM reading ORDER BY ts DESC LIMIT 1").fetchone()
+        try:
+            rare = conn.execute("SELECT ts,duration_s,dose,temperature_c,charge_pct "
+                                "FROM rare ORDER BY ts DESC LIMIT 1").fetchone()
+        except sqlite3.OperationalError:
+            rare = None       # a database written before the rare table existed
+        watch, why = watch_state(conn, baseline, window, sigma)
+    except sqlite3.Error as e:
+        return {"ok": False, "error": f"cannot read {path}: {e}"}
+    out = {"ok": True, "readings": n, "reading": None, "device": None,
+           "watch": watch, "watch_note": why}
+    if row:
+        ts, cps, cps_err, dr, dr_err = row
+        out["reading"] = {"ts": ts, "age_s": age_s(ts, now),
+                          "dose_rate_usv_h": None if dr is None else round(dr * TO_MICRO, 4),
+                          "dose_rate_err_pct": dr_err,
+                          "count_rate_cps": None if cps is None else round(cps, 3),
+                          "count_rate_err_pct": cps_err}
+    if rare:
+        ts, dur, dose, temp, charge = rare
+        out["device"] = {"ts": ts, "age_s": age_s(ts, now),
+                         "accumulated_dose_usv": None if dose is None else round(dose * TO_MICRO, 4),
+                         "accumulated_over_s": dur, "temperature_c": temp, "battery_pct": charge}
+    return out
+
+
+def cmd_status(a):
+    """One JSON object on stdout, exit 0 when the database could be read, 2 when it could not."""
+    out = status(a.db, a.baseline, a.window, a.sigma)
     print(json.dumps(out))
-    return 0
+    return 0 if out["ok"] else 2
 
 
 EXPLAIN_SYSTEM = (
@@ -392,6 +482,48 @@ def cmd_selftest(a):
     alert_ok = z_quiet < 5.0 and z_loud >= 5.0 and z_dev >= 5.0
     ok = ok and alert_ok
 
+    # status: what a dashboard reads. Four databases, four answers that must not look alike.
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="radwatch-selftest-")
+    missing = os.path.join(tmp, "typo.sqlite")
+    st_missing = status(missing)
+    # NEGATIVE CONTROL: a wrong path is an error, and reading it must not create the file
+    miss_ok = st_missing["ok"] is False and "no radwatch database" in st_missing["error"] \
+        and not os.path.exists(missing)
+    empty = os.path.join(tmp, "empty.sqlite"); db(empty).close()
+    st_empty = status(empty)
+    empty_ok = st_empty["ok"] is True and st_empty["reading"] is None and st_empty["readings"] == 0
+    old = os.path.join(tmp, "old.sqlite")     # written before the rare table existed
+    c = sqlite3.connect(old)
+    c.execute("CREATE TABLE reading(ts TEXT PRIMARY KEY, count_rate REAL, count_rate_err REAL, "
+              "dose_rate REAL, dose_rate_err REAL, flags INT)")
+    c.execute("INSERT INTO reading VALUES('2026-10-01T12:00:00',5.0,3.0,1.2e-7,10.0,0)")
+    c.commit(); c.close()
+    st_old = status(old, now=datetime(2026, 10, 1, 12, 0, 30))
+    old_ok = st_old["ok"] and st_old["device"] is None and st_old["reading"]["age_s"] == 30.0
+    full = os.path.join(tmp, "full.sqlite"); c = db(full)
+    t0 = datetime(2026, 10, 1, 12, 0, 0)
+    from datetime import timedelta
+    for i in range(40):
+        c.execute("INSERT INTO reading VALUES(?,?,?,?,?,?)",
+                  ((t0 + timedelta(seconds=i)).isoformat(), 10.0, 3.0, 1.0e-7, 10.0, 0))
+    c.execute("INSERT INTO rare VALUES(?,?,?,?,?)", (t0.isoformat(), 3600, 2.5e-6, 24.5, 81.0))
+    c.commit(); c.close()
+    st_full = status(full, baseline=30, window=10, now=t0 + timedelta(seconds=99))
+    r, d = st_full["reading"] or {}, st_full["device"] or {}
+    full_ok = (st_full["ok"] and r.get("age_s") == 60.0 and r.get("dose_rate_usv_h") == 0.1
+               and r.get("count_rate_cps") == 10.0 and d.get("accumulated_dose_usv") == 2.5
+               and d.get("battery_pct") == 81.0 and d.get("temperature_c") == 24.5
+               and st_full["watch"] is not None and st_full["watch"]["alert"] is False)
+    # too few readings for the default baseline: no verdict, and a reason instead of a fake one
+    st_short = status(full, now=t0)
+    short_ok = st_short["watch"] is None and "not enough readings" in (st_short["watch_note"] or "")
+    stat_ok = miss_ok and empty_ok and old_ok and full_ok and short_ok
+    print(f"status        : missing->error {miss_ok}, empty->no reading {empty_ok}, "
+          f"pre-rare db {old_ok}, full {full_ok}, short history {short_ok}")
+    ok = ok and stat_ok
+    import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -413,6 +545,11 @@ def main():
     w.add_argument("--baseline", type=int, default=600, help="readings forming the baseline")
     w.add_argument("--window", type=int, default=30, help="recent readings tested against it")
     w.add_argument("--sigma", type=float, default=5.0, help="alert threshold in sigma")
+    ss = sub.add_parser("status"); ss.set_defaults(fn=cmd_status)
+    ss.add_argument("--db", default="radwatch.sqlite")
+    ss.add_argument("--baseline", type=int, default=600)
+    ss.add_argument("--window", type=int, default=30)
+    ss.add_argument("--sigma", type=float, default=5.0)
     ex = sub.add_parser("explain"); ex.set_defaults(fn=cmd_explain)
     ex.add_argument("--db", default="radwatch.sqlite")
     ex.add_argument("--endpoint", default="http://127.0.0.1:8081", help="OpenAI-compatible local model")
